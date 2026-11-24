@@ -1,0 +1,173 @@
+//@version=6
+indicator("1H Liquidity Sweep + 3M Confirmation", overlay=true, max_labels_count=500, max_boxes_count=300)
+
+//==================================================
+// INPUTS
+//==================================================
+
+// 1H Market Structure
+htfPivotLeft  = input.int(2, "1H Pivot Left", minval=1, group="1H Structure")
+htfPivotRight = input.int(2, "1H Pivot Right", minval=1, group="1H Structure")
+
+// 3M Confirmation
+mssLeft  = input.int(2, "3M CHoCH Pivot Left", minval=1, group="3M Confirmation")
+mssRight = input.int(2, "3M CHoCH Pivot Right", minval=1, group="3M Confirmation")
+
+// Setup management
+maxWaitBars  = input.int(20, "Maximum Bars After Sweep", minval=1, group="Setup Management")
+requireClose = input.bool(true, "Sweep Must Close Back Inside", group="Setup Management")
+
+// Display
+showFVG    = input.bool(true, "Show FVG Zones", group="Display")
+showSweeps = input.bool(true, "Show 1H Sweeps", group="Display")
+showBias   = input.bool(true, "Show Market Bias", group="Display")
+
+// Require 3-minute chart
+if barstate.isfirst and timeframe.period != "3"
+    runtime.error("Please use this indicator on the 3-minute chart.")
+
+//==================================================
+// 1. 1H MARKET STRUCTURE
+//==================================================
+
+[htfPH, htfPHTime] = request.security(
+     syminfo.tickerid, "60",
+     [ta.pivothigh(high, htfPivotLeft, htfPivotRight)[1],
+      time[htfPivotRight + 1]],
+     lookahead=barmerge.lookahead_on)
+
+[htfPL, htfPLTime] = request.security(
+     syminfo.tickerid, "60",
+     [ta.pivotlow(low, htfPivotLeft, htfPivotRight)[1],
+      time[htfPivotRight + 1]],
+     lookahead=barmerge.lookahead_on)
+
+var float lastHigh = na
+var float prevHigh = na
+var float lastLow  = na
+var float prevLow  = na
+
+var int lastHighTime = na
+var int lastLowTime  = na
+
+if not na(htfPH) and (na(lastHighTime) or htfPHTime != lastHighTime)
+    prevHigh     := lastHigh
+    lastHigh     := htfPH
+    lastHighTime := htfPHTime
+
+if not na(htfPL) and (na(lastLowTime) or htfPLTime != lastLowTime)
+    prevLow     := lastLow
+    lastLow     := htfPL
+    lastLowTime := htfPLTime
+
+bullishStructure = not na(prevHigh) and not na(prevLow) and lastHigh > prevHigh and lastLow > prevLow
+bearishStructure = not na(prevHigh) and not na(prevLow) and lastHigh < prevHigh and lastLow < prevLow
+
+// 1 = bullish, -1 = bearish, 0 = neutral
+marketBias = bullishStructure ? 1 : bearishStructure ? -1 : 0
+
+//==================================================
+// 2. PREVIOUS 1H CANDLE LIQUIDITY SWEEP
+//==================================================
+
+[h1Low, h1PrevLow, h1Close, h1High, h1PrevHigh] = request.security(
+     syminfo.tickerid, "60",
+     [low[1], low[2], close[1], high[1], high[2]],
+     lookahead=barmerge.lookahead_on)
+
+newH1 = timeframe.change("60")
+
+// Bullish market: only watch for a sweep of the previous 1H low.
+bullishSweep = newH1 and marketBias == 1 and h1Low < h1PrevLow and (not requireClose or h1Close > h1PrevLow)
+
+// Bearish market: only watch for a sweep of the previous 1H high.
+bearishSweep = newH1 and marketBias == -1 and h1High > h1PrevHigh and (not requireClose or h1Close < h1PrevHigh)
+
+//==================================================
+// 3. 3M CHoCH DETECTION
+//==================================================
+
+mssPH = ta.pivothigh(high, mssLeft, mssRight)
+mssPL = ta.pivotlow(low, mssLeft, mssRight)
+
+var float lastMssHigh = na
+var float lastMssLow  = na
+
+if not na(mssPH)
+    lastMssHigh := mssPH
+
+if not na(mssPL)
+    lastMssLow := mssPL
+
+bullishChoch = not na(lastMssHigh) and ta.crossover(close, lastMssHigh)
+bearishChoch = not na(lastMssLow) and ta.crossunder(close, lastMssLow)
+
+//==================================================
+// 4. 3M IMBALANCE / FAIR VALUE GAP
+//==================================================
+
+bullishFVG = bar_index >= 2 and low > high[2]
+bearishFVG = bar_index >= 2 and high < low[2]
+
+//==================================================
+// 5. SETUP MANAGEMENT
+//==================================================
+
+var int pendingDirection = 0
+var int sweepBar = na
+
+if bullishSweep
+    pendingDirection := 1
+    sweepBar := bar_index
+
+if bearishSweep
+    pendingDirection := -1
+    sweepBar := bar_index
+
+if pendingDirection != 0 and not na(sweepBar) and bar_index - sweepBar > maxWaitBars
+    pendingDirection := 0
+    sweepBar := na
+
+afterSweep = not na(sweepBar) and bar_index > sweepBar
+
+// Imbalance OR change of character confirms the setup.
+buySignal  = pendingDirection == 1  and afterSweep and (bullishChoch or bullishFVG)
+sellSignal = pendingDirection == -1 and afterSweep and (bearishChoch or bearishFVG)
+
+drawBullFVG = showFVG and pendingDirection == 1  and afterSweep and bullishFVG
+drawBearFVG = showFVG and pendingDirection == -1 and afterSweep and bearishFVG
+
+if buySignal or sellSignal
+    pendingDirection := 0
+    sweepBar := na
+
+//==================================================
+// 6. VISUALS
+//==================================================
+
+if drawBullFVG
+    box.new(bar_index - 2, low, bar_index + 10, high[2],
+         border_color=color.new(color.green, 60),
+         bgcolor=color.new(color.green, 85))
+
+if drawBearFVG
+    box.new(bar_index - 2, low[2], bar_index + 10, high,
+         border_color=color.new(color.red, 60),
+         bgcolor=color.new(color.red, 85))
+
+bgcolor(showBias ? (marketBias == 1 ? color.new(color.green, 94) : marketBias == -1 ? color.new(color.red, 94) : na) : na, title="1H Bias")
+
+plotshape(showSweeps and bullishSweep, "Bullish Sweep", shape.diamond, location.belowbar, color.new(color.teal, 0), size=size.tiny, text="Sweep")
+plotshape(showSweeps and bearishSweep, "Bearish Sweep", shape.diamond, location.abovebar, color.new(color.orange, 0), size=size.tiny, text="Sweep")
+
+plotshape(buySignal, "BUY", shape.labelup, location.belowbar, color.green, size=size.small, text="BUY", textcolor=color.white)
+plotshape(sellSignal, "SELL", shape.labeldown, location.abovebar, color.red, size=size.small, text="SELL", textcolor=color.white)
+
+//==================================================
+// 7. ALERTS
+//==================================================
+
+alertcondition(buySignal, "BUY Signal", "1H sweep + 3M confirmation: BUY")
+alertcondition(sellSignal, "SELL Signal", "1H sweep + 3M confirmation: SELL")
+alertcondition(bullishSweep, "Bullish 1H Sweep", "Bullish 1H liquidity sweep")
+alertcondition(bearishSweep, "Bearish 1H Sweep", "Bearish 1H liquidity sweep")
