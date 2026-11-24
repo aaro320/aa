@@ -1,0 +1,211 @@
+//@version=6
+indicator("Liquidity Sweep (Chart TF) + Lower-TF Confirmation", overlay=true, max_labels_count=500, max_boxes_count=300, max_lines_count=300)
+
+//==================================================
+// INPUTS
+//==================================================
+
+// Sweep / structure timeframe (default 1H). Put your chart on this timeframe (or lower, but above the confirmation TF).
+sweepTF = input.timeframe("60", "Sweep / Structure Timeframe", group="Timeframes", tooltip="Timeframe used for market structure and the liquidity sweep. Cannot be lower than the chart timeframe.")
+
+// Confirmation timeframe (default 3M). Must be LOWER than the chart timeframe.
+confTF  = input.timeframe("3", "Confirmation Timeframe", group="Timeframes", tooltip="Lower timeframe used to look for imbalance (FVG) or change of character (CHoCH) after the sweep. Must be lower than the chart timeframe.")
+
+// Sweep-TF market structure
+htfPivotLeft  = input.int(2, "Structure Pivot Left", minval=1, group="Sweep TF Structure")
+htfPivotRight = input.int(2, "Structure Pivot Right", minval=1, group="Sweep TF Structure")
+
+// Confirmation CHoCH (on the confirmation timeframe)
+mssLeft  = input.int(2, "CHoCH Pivot Left", minval=1, group="Confirmation TF")
+mssRight = input.int(2, "CHoCH Pivot Right", minval=1, group="Confirmation TF")
+
+// Setup management
+maxWaitBars  = input.int(3, "Maximum Chart Bars After Sweep", minval=1, group="Setup Management", tooltip="How many chart candles (including the sweep candle) the setup stays active while waiting for confirmation.")
+requireClose = input.bool(true, "Sweep Must Close Back Inside", group="Setup Management")
+
+// Display
+showFVG    = input.bool(true, "Show Confirming FVG Zone", group="Display")
+showSweeps = input.bool(true, "Show Sweep (candle box, level line, label)", group="Display")
+showBias   = input.bool(true, "Show Market Bias", group="Display")
+
+// Timeframe checks
+if barstate.isfirst
+    if timeframe.in_seconds(confTF) >= timeframe.in_seconds(timeframe.period)
+        runtime.error("Chart timeframe (" + timeframe.period + ") must be HIGHER than the Confirmation Timeframe (" + confTF + ").")
+    if timeframe.in_seconds(sweepTF) < timeframe.in_seconds(timeframe.period)
+        runtime.error("Sweep Timeframe (" + sweepTF + ") cannot be lower than the chart timeframe (" + timeframe.period + ").")
+
+//==================================================
+// 1. SWEEP-TIMEFRAME MARKET STRUCTURE
+//==================================================
+
+[htfPH, htfPHTime] = request.security(
+     syminfo.tickerid, sweepTF,
+     [ta.pivothigh(high, htfPivotLeft, htfPivotRight)[1],
+      time[htfPivotRight + 1]],
+     lookahead=barmerge.lookahead_on)
+
+[htfPL, htfPLTime] = request.security(
+     syminfo.tickerid, sweepTF,
+     [ta.pivotlow(low, htfPivotLeft, htfPivotRight)[1],
+      time[htfPivotRight + 1]],
+     lookahead=barmerge.lookahead_on)
+
+var float lastHigh = na
+var float prevHigh = na
+var float lastLow  = na
+var float prevLow  = na
+
+var int lastHighTime = na
+var int lastLowTime  = na
+
+if not na(htfPH) and (na(lastHighTime) or htfPHTime != lastHighTime)
+    prevHigh     := lastHigh
+    lastHigh     := htfPH
+    lastHighTime := htfPHTime
+
+if not na(htfPL) and (na(lastLowTime) or htfPLTime != lastLowTime)
+    prevLow     := lastLow
+    lastLow     := htfPL
+    lastLowTime := htfPLTime
+
+bullishStructure = not na(prevHigh) and not na(prevLow) and lastHigh > prevHigh and lastLow > prevLow
+bearishStructure = not na(prevHigh) and not na(prevLow) and lastHigh < prevHigh and lastLow < prevLow
+
+// 1 = bullish, -1 = bearish, 0 = neutral
+marketBias = bullishStructure ? 1 : bearishStructure ? -1 : 0
+
+//==================================================
+// 2. PREVIOUS SWEEP-TF CANDLE LIQUIDITY SWEEP
+//==================================================
+
+// [1] = swept candle (latest completed), [2] = candle before it (its low/high is the liquidity).
+[sLow, sPrevLow, sClose, sHigh, sPrevHigh, sTime, sPrevTime] = request.security(
+     syminfo.tickerid, sweepTF,
+     [low[1], low[2], close[1], high[1], high[2], time[1], time[2]],
+     lookahead=barmerge.lookahead_on)
+
+newSweepCandle = timeframe.change(sweepTF)
+
+// Bullish market: only watch for a sweep of the previous candle's low.
+bullishSweep = newSweepCandle and marketBias == 1 and sLow < sPrevLow and (not requireClose or sClose > sPrevLow)
+
+// Bearish market: only watch for a sweep of the previous candle's high.
+bearishSweep = newSweepCandle and marketBias == -1 and sHigh > sPrevHigh and (not requireClose or sClose < sPrevHigh)
+
+//==================================================
+// 3. LOWER-TF CONFIRMATION (CHoCH + FVG), CALCULATED ON confTF
+//==================================================
+
+// Runs on every confirmation-timeframe bar and returns one value per bar:
+// time, time[2], bullish CHoCH, bearish CHoCH, bullish FVG, bearish FVG, low, high, low[2], high[2]
+f_confirm() =>
+    ph = ta.pivothigh(high, mssLeft, mssRight)
+    pl = ta.pivotlow(low, mssLeft, mssRight)
+    var float lastH = na
+    var float lastL = na
+    if not na(ph)
+        lastH := ph
+    if not na(pl)
+        lastL := pl
+    crossUp   = ta.crossover(close, lastH)
+    crossDown = ta.crossunder(close, lastL)
+    bChoch = not na(lastH) and crossUp
+    sChoch = not na(lastL) and crossDown
+    bFvg = bar_index >= 2 and low > high[2]
+    sFvg = bar_index >= 2 and high < low[2]
+    [time, time[2], bChoch ? 1 : 0, sChoch ? 1 : 0, bFvg ? 1 : 0, sFvg ? 1 : 0, low, high, low[2], high[2]]
+
+[lt, lt2, lBC, lSC, lBF, lSF, lLow, lHigh, lLow2, lHigh2] = request.security_lower_tf(syminfo.tickerid, confTF, f_confirm())
+
+//==================================================
+// 4. SETUP MANAGEMENT
+//==================================================
+
+var int pendingDirection = 0
+var int sweepBar = na
+
+if bullishSweep
+    pendingDirection := 1
+    sweepBar := bar_index
+
+if bearishSweep
+    pendingDirection := -1
+    sweepBar := bar_index
+
+// Expire old setups.
+if pendingDirection != 0 and not na(sweepBar) and bar_index - sweepBar >= maxWaitBars
+    pendingDirection := 0
+    sweepBar := na
+
+// Scan the confirmation-TF bars inside this chart candle, in time order.
+// The first FVG or CHoCH in the setup direction confirms the trade.
+int dir = pendingDirection
+int sigIdx = -1
+
+if dir != 0 and array.size(lt) > 0
+    for i = 0 to array.size(lt) - 1
+        bool hit = dir == 1 ? (array.get(lBC, i) == 1 or array.get(lBF, i) == 1) : (array.get(lSC, i) == 1 or array.get(lSF, i) == 1)
+        if hit
+            sigIdx := i
+            break
+
+buySignal  = dir == 1  and sigIdx >= 0
+sellSignal = dir == -1 and sigIdx >= 0
+
+// Setup is consumed once a signal fires.
+if sigIdx >= 0
+    pendingDirection := 0
+    sweepBar := na
+
+//==================================================
+// 5. VISUALS
+//==================================================
+
+// How far (in ms) lines and zones extend to the right.
+spanMs = timeframe.in_seconds(timeframe.period) * 1000 * math.max(maxWaitBars, 1)
+
+// --- Bullish sweep: box around the swept candle + line at the swept low ---
+if showSweeps and bullishSweep
+    box.new(left=sTime, top=sHigh, right=time, bottom=sLow, xloc=xloc.bar_time,
+         border_color=color.teal, bgcolor=color.new(color.teal, 88))
+    line.new(x1=sPrevTime, y1=sPrevLow, x2=time + spanMs, y2=sPrevLow, xloc=xloc.bar_time,
+         color=color.teal, style=line.style_dashed, width=2)
+    label.new(x=time, y=sPrevLow, text="Sweep Low", xloc=xloc.bar_time,
+         style=label.style_label_up, color=color.teal, textcolor=color.white, size=size.small)
+
+// --- Bearish sweep: box around the swept candle + line at the swept high ---
+if showSweeps and bearishSweep
+    box.new(left=sTime, top=sHigh, right=time, bottom=sLow, xloc=xloc.bar_time,
+         border_color=color.orange, bgcolor=color.new(color.orange, 88))
+    line.new(x1=sPrevTime, y1=sPrevHigh, x2=time + spanMs, y2=sPrevHigh, xloc=xloc.bar_time,
+         color=color.orange, style=line.style_dashed, width=2)
+    label.new(x=time, y=sPrevHigh, text="Sweep High", xloc=xloc.bar_time,
+         style=label.style_label_down, color=color.orange, textcolor=color.white, size=size.small)
+
+// --- BUY / SELL placed at the exact confirmation-TF candle ---
+if sigIdx >= 0
+    sigTime = array.get(lt, sigIdx)
+    if dir == 1
+        label.new(x=sigTime, y=array.get(lLow, sigIdx), text="BUY", xloc=xloc.bar_time,
+             style=label.style_label_up, color=color.green, textcolor=color.white, size=size.small)
+        if showFVG and array.get(lBF, sigIdx) == 1
+            box.new(left=array.get(lt2, sigIdx), top=array.get(lLow, sigIdx), right=sigTime + spanMs, bottom=array.get(lHigh2, sigIdx), xloc=xloc.bar_time,
+                 border_color=color.new(color.green, 60), bgcolor=color.new(color.green, 85))
+    else
+        label.new(x=sigTime, y=array.get(lHigh, sigIdx), text="SELL", xloc=xloc.bar_time,
+             style=label.style_label_down, color=color.red, textcolor=color.white, size=size.small)
+        if showFVG and array.get(lSF, sigIdx) == 1
+            box.new(left=array.get(lt2, sigIdx), top=array.get(lLow2, sigIdx), right=sigTime + spanMs, bottom=array.get(lHigh, sigIdx), xloc=xloc.bar_time,
+                 border_color=color.new(color.red, 60), bgcolor=color.new(color.red, 85))
+
+bgcolor(showBias ? (marketBias == 1 ? color.new(color.green, 94) : marketBias == -1 ? color.new(color.red, 94) : na) : na, title="Sweep TF Bias")
+
+//==================================================
+// 6. ALERTS
+//==================================================
+
+alertcondition(buySignal, "BUY Signal", "Sweep + lower-TF confirmation: BUY")
+alertcondition(sellSignal, "SELL Signal", "Sweep + lower-TF confirmation: SELL")
+alertcondition(bullishSweep, "Bullish Sweep", "Bullish liquidity sweep")
+alertcondition(bearishSweep, "Bearish Sweep", "Bearish liquidity sweep")
